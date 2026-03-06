@@ -14,7 +14,8 @@ Event-driven Go framework for async AI agents using PostgreSQL for state managem
 3. **MCP server tools?** -> See [references/mcp.md](references/mcp.md)
 4. **Agent hierarchies?** -> See [references/agents.md](references/agents.md)
 5. **Cancel or regenerate runs?** -> See "Cancel and Regenerate" below
-6. **Distributed workers / transactions / compaction / UI?** -> See [references/advanced.md](references/advanced.md)
+6. **Tool call visibility / callbacks?** -> See "Tool Call Visibility" below
+7. **Distributed workers / transactions / compaction / UI?** -> See [references/advanced.md](references/advanced.md)
 
 ## Quick Start
 
@@ -96,9 +97,11 @@ Batch API = 50% cost discount, higher latency. Streaming = standard pricing, rea
 
 ```go
 type RunOptions struct {
-    Variables            map[string]any  // Passed to tools via context
-    OverrideInstructions string          // Replaces agent's system prompt
-    AppendInstructions   string          // Appended to agent's system prompt
+    Variables            map[string]any        // Passed to tools via context
+    OverrideInstructions string                // Replaces agent's system prompt
+    AppendInstructions   string                // Appended to agent's system prompt
+    OnToolStart          func(ToolCallEvent)   // Real-time callback when tool starts
+    OnToolComplete       func(ToolCallEvent)   // Real-time callback when tool completes
 }
 ```
 
@@ -112,6 +115,7 @@ response, err := client.RunFastSync(ctx, sessionID, agent.ID, "Hello!", nil)
 // response.StopReason   - "end_turn", "max_tokens", "tool_use"
 // response.Usage        - InputTokens, OutputTokens
 // response.Message      - full Message with Content []ContentBlock
+// response.ToolCalls    - []ToolCall with Name, Input, Output, Duration, State, etc.
 ```
 
 ### Run Variables and Instruction Overrides
@@ -154,6 +158,38 @@ newRunID, _ := client.RunFast(ctx, sessionID, agent.ID, "Do something else", nil
 
 `CancelRun` is idempotent (no-op on terminal runs), race-safe (`SELECT FOR UPDATE`), and unblocks `WaitForRun` callers. `RegenerateRun` only works on terminal runs.
 
+### Tool Call Visibility
+
+Inspect tool calls after a run completes, in real-time via callbacks, or via query methods.
+
+**Post-run inspection:**
+```go
+response, _ := client.RunFastSync(ctx, sessionID, agent.ID, "What's the weather?", nil)
+for _, tc := range response.ToolCalls {
+    fmt.Printf("%s: input=%s output=%s duration=%v\n", tc.Name, tc.Input, tc.Output, tc.Duration)
+}
+```
+
+**Real-time callbacks:**
+```go
+response, _ := client.RunFastSync(ctx, sessionID, agent.ID, "What's the weather?", &agentpg.RunOptions{
+    OnToolStart: func(event agentpg.ToolCallEvent) {
+        fmt.Printf("Tool started: %s\n", event.ToolName)
+    },
+    OnToolComplete: func(event agentpg.ToolCallEvent) {
+        fmt.Printf("Tool completed: %s (took %v, error=%v)\n", event.ToolName, event.Duration, event.IsError)
+    },
+})
+```
+
+**Query methods:**
+```go
+toolCalls, _ := client.GetRunToolCalls(ctx, runID)          // All tool calls for a run
+toolCalls, _ := client.GetIterationToolCalls(ctx, iterID)   // Tool calls for one iteration
+```
+
+Callbacks fire in goroutines with panic recovery (never block tool execution). They are **in-memory only** — only fire on the instance that executes the tool. Callbacks propagate to child runs in agent-as-tool hierarchies.
+
 ### Model Selection
 
 ```go
@@ -183,10 +219,42 @@ type AgentDefinition struct {
 type Response struct {
     Text           string
     StopReason     string
-    Usage          Usage  // InputTokens, OutputTokens
+    Usage          Usage       // InputTokens, OutputTokens
     Message        *Message
     IterationCount int
     ToolIterations int
+    ToolCalls      []ToolCall  // All tool calls made during the run
+}
+
+// ToolCall - individual tool execution details
+type ToolCall struct {
+    Name            string
+    Input           json.RawMessage
+    Output          string
+    IsError         bool
+    ErrorMessage    string
+    IsAgentTool     bool
+    AgentID         *uuid.UUID
+    ChildRunID      *uuid.UUID
+    Duration        time.Duration
+    IterationNumber int
+    State           ToolExecutionState  // "completed", "failed", "skipped"
+    StartedAt       *time.Time
+    CompletedAt     *time.Time
+}
+
+// ToolCallEvent - passed to OnToolStart/OnToolComplete callbacks
+type ToolCallEvent struct {
+    RunID           uuid.UUID
+    SessionID       uuid.UUID
+    ToolName        string
+    ToolInput       json.RawMessage
+    IsAgentTool     bool
+    IterationNumber int
+    Output          string         // Only on complete
+    IsError         bool           // Only on complete
+    ErrorMessage    string         // Only on complete
+    Duration        time.Duration  // Only on complete
 }
 
 // Run states: pending -> batch_submitting -> batch_pending -> batch_processing
@@ -231,3 +299,4 @@ Full source code for all examples organized by topic. Consult the relevant file 
 - **[references/examples-ui.md](references/examples-ui.md)** - Admin UI: basic embedding, auth middleware, full-featured dashboard
 - **[references/examples-retry.md](references/examples-retry.md)** - Error handling: instant retry, ToolCancel/Discard/Snooze error types, exponential backoff
 - **[references/examples-cancel.md](references/examples-cancel.md)** - Cancel and regenerate: stop running agents, regenerate failed runs, continuation after cancel
+- **[references/examples-tool-calls.md](references/examples-tool-calls.md)** - Tool call visibility: real-time callbacks, Response.ToolCalls inspection, GetRunToolCalls queries
